@@ -1,0 +1,567 @@
+﻿param(
+  [Parameter(Mandatory = $false)][switch]$help,
+  [Parameter(Mandatory = $false)][string]$version,
+  [Parameter(Mandatory = $false)][string]$source, 
+  [Parameter(Mandatory = $false)][array]$pclist,    
+  [Parameter(Mandatory = $false)][switch]$interactive,
+  [Parameter(Mandatory = $false)][switch]$scheduled,
+  [Parameter(Mandatory = $false)][switch]$uninstall
+)                                                           
+<#------------------------------------------------------------------
+EDIT 5 VARIABLES BELOW. (MAKE = "" IF UNUSED)
+ANGLE BRACKETS "< >" ENCLOSE PLACEHOLDERS. YOU SHOULD BE REPLACING W/ ARGS
+------------------------------------------------------------------#>
+set-location -path $psscriptroot
+
+# INCLUDE INSTALLER IN ARGS. SEE EXAMPLES BELOW. REFER TO SOFTWARE GUIDE FOR HELP WITH ARGUMENTS.   
+[string]$setupArgz =  "<setupArgz>" 
+[string]$uninstallArgz = "<uninstallArgz>" 
+
+# EXE INSTALLERS USUALLY INCLUDE PATCHING IN INSTALLER. MSI MAY USE MSP PATCH FILE.        
+[string]$patchArgz = "<patchArgz>"
+
+# FOR MSI INSTALLER USE "MSIEXEC.EXE" FOR EXE INSTALLER USE "CMD.EXE"     
+[string]$launcher = "<launcher>"                  
+
+# PATH TO THE PARENT SOURCE DIR (UNC PATH). COPIES DOWN EVERYTHING THERE. BE SELECTIVE. FOLDER MGMT MATTERS
+[string]$dirCopySource = "<dirCopySource>"
+
+
+<#-----------------------------------------------------------------------------------------------
+EXAMPLE FOR EXE        (SETUP.EXE /HELP OR /? OR -HELP)                            
+---------------------------------------------------------------------------------------------#><#
+  [string]$setupArgz = "setup.exe -xml .\pim\xml\mathcad.xml" 
+  [string]$uninstallArgz = ""
+  [string]$dirCopySource = "\\pbsenv.lan\l\IT\CADD\Software\Mathcad\Installer\Prime_7"
+  [string]$launcher = "cmd.exe'
+
+----------------------------------------------------------------------------------------------------------------#><#
+EXAMPLE FOR MSI         (MSIEXEC.EXE -HELP)         # NOTE ESCAPING INNER QUOTES WITH APOSTROPHES
+--------------------------------------------------------------------------------------------------------------------
+  [string]$setupArgz = "/i `"$dirWorkingRemote\EmbravaConnect.msi`" /l*v `".\log`" /qn Connections=TEAMS,TEAMSSERVER,MANUAL"  
+  [string]$launcher = "msiexec.exe'
+--------------------------------------------------------------------------------------------------------------------
+CAN LEAVE THESE VARIABLES AS IS
+--------------------------------------------------------------------------------------------------------------------#>
+[boolean]$restrictRemoteInstall = $true
+[string]$pingEnginePath = "\\pbsenv.lan\l\IT\Scripts\new\MISC\pcping5.exe"      # this needs to be stored locally. Wont work in net location
+[string]$remoteInstallServer = "OR-PO-IT01"
+[string]$defaultPCList = ".\pclist"                                       # file that holds the list of targets (line delimited) 
+[string]$dirParent =  ($dirCopySource) -replace ('.*\\')                  # used for local stage sub folder name.
+[string]$stage = "c:\users\public\stage\$($dirParent)"                    # working local directory where installer files will be copied to on remote machine
+[string]$remoteStage = $stage.replace(':', '$')                           # replaces with $ as c drive may not be shared
+[string]$scriptFullName = $($MyInvocation.MyCommand.Name)
+[string]$softName = "$dirParent"                                          # used for script name (when auto-generated) and log name.
+[string]$timestamp = "$(get-date -Format('yyyyMMddhhmmss'))"
+[string]$log = "$stage\$($softName)-$($timestamp).txt"                    # log var made (not used by default in template)
+[string]$addArgzRobo = "/njh /njs /ndl /nc /ns /np /e /R:0 /W:0" #/mt:8)  # Robocopy switches. Remove /MT (multi-thread) if big files. For lots of small files do MT:8 (or higher).
+[array]$scriptVariables = @($setupArgz,$uninstallArgz,$patchArgz,$launcher,$dirCopySource,$softName)
+
+<#-----------------------------------------------------------------------------------------------------------
+FUTURE IMPROVEMENTS:
+
+REMOVE PUBLIC DESKTOP ICONS
+UNINSTALL SHOULD REMOVE ASSOC FILES IN STAGE
+FASTER PING ENGINE
+SCHEDULED TASK FOR FAILED COPY JOBS FROM SERVER
+
+
+#[string]$PublicDesktopIcon = "PTC Mathcad Prime $($version)"           # probably work with .contains() args
+
+------------------------------------------------------------------------------------------------------------#>
+
+<#-----------------------------------------------------------------------------------------------------------
+PCLISTEDIT
+
+.DESCRIPTION
+INTERACTIVE FUNCTION. OPENS FILE ASSIGNED TO $DEFAULTPCLIST WITH NOTEPAD. IF FILE
+DOESN'T EXIST IT WILL BE MADE. PUTS TXT FILE CONTENTS INTO ARRAY (LINE DELIMITED)
+
+.OUTPUTS
+RETURNS ARRAY OF NAMES
+------------------------------------------------------------------------------------------------------------#>
+  function PCListEdit { 
+    set-location -path $PSScriptRoot                                # prep for relative path                             
+
+    if (!(test-path -Path $defaultPCList)) {                        # check list file exists
+      $error.clear()
+      try { New-Item -ItemType file -path $defaultPCList }           # make it if missing
+	    catch [exception] { $error
+      break                                                         # abort on failure
+      }
+    }
+    write-host "[EDIT TARGET LIST] $defaultPCList"                  # tell user why notepad opened
+    start-process notepad.exe -wait -ArgumentList $defaultPCList    # open pc list file 
+    $PCList = @(get-content -path $defaultPCList)                 
+
+    if($PCList.count -lt 1){                                        # require at least 1 pc name
+      write-host "[ADD AT LEAST 1 TARGET PC NAME]"
+      PCListEdit                                                    # re-call function if less than 1 pc name
+    }                         
+    return $PCList                                                  # returns names array to caller
+  }
+
+
+<#------------------------------------------------------------------------------------
+COPYFILESTOPC
+
+.DESCRIPTION
+COPIES FILES FROM $DIRCOPYSOURCE PATH TO TARGET FILESYSTEM IN LOCATION ASSIGNED TO
+$STAGE
+--------------------------------------------------------------------------------------#>
+  function CopyFilesToPC {
+    param(
+      [Parameter(Mandatory = $false)] [switch]$help,
+      [Parameter(Mandatory = $false)] [string]$source,
+      [Parameter(Mandatory = $false)] [array]$pclist = $pclist     # sets default value to passed array from global scope for stacking scripts in deployment
+    )
+    $notConnectedPC = @()                                         # initialize array for storing not pingable pc names
+
+    if ($help) {                                                 
+      $helpinfo = ("
+    ****************************************************************************
+    CopyFilesToPC   
+      
+      COPIES FILES FROM $DIRCOPYSOURCE 
+      TO $STAGE ON REMOTE PC
+        -SOURCE `"<SOURCE DIRECTORY>`" [STRING] DEFAULT SET TO $dirCopySource)
+        -PCLIST `"<SOURCE FILE>`"      [STRING] DEFAULT SET TO $defaultPCList)
+    ")
+      return $helpinfo
+    }
+
+    if ($source -ne '') { $global:dirCopySource = $source }                 # for calling script with unique param. Sets as global var
+    $PCaccessible = $true
+   
+    foreach ($pc in $PCList) {                                              # loops through PCs to copy installer files down
+      $PCAccessible = $true
+      $error.clear()
+
+      try{ 
+        test-connection  -computername $pc -count 1 -erroraction stop | out-null         # test ping each pc
+        } catch {
+        $notConnectedPC += $pc                                                           # collect pc names that failed ping
+        $PCaccessible = $false
+      }
+
+      if($PCaccessible) {
+        
+        $argz = "& robocopy `"$($dirCopySource)`" `"\\$pc\$RemoteStage`" $addArgzRobo"    # '&' allows robocopy 'native command' like in cmd. Avoids new window
+                                                                                          # Robocopy skips matched files. same name modified files overwrite by default.
+        if($PCList[0] -eq $pc) {                                                          # show what command was used only for first pc
+        write-host ("                                           
+        [ROBOCOPY ARG USED] $argz `r`n 
+        ")
+        }
+        write-host "[COPYING TO] $pc"                  
+        Invoke-Expression $argz | out-null                                                # the command that does the copy job
+      }
+    }
+    if($notConnectedPC.count -gt 0) {                                                     # listing non-pingable pc names
+      write-host "[NOT ACCESSIBLE]"
+      $notConnectedPC
+      #--------------------------------------------- set and register scheduled task here future improvement
+    }
+  }
+
+<#----------------------------------------------------------------------------------------------------
+INSTALL
+
+.DESCRIPTION
+RUNS INSTALLER ON SELECTED MACHINES IN PARALLEL
+----------------------------------------------------------------------------------------------------#>
+  function install {
+    param(
+    #[Parameter(Mandatory = $false)]$target = [System.Collections.Arraylist]@(),       # target param for passing list w/ diff method. (Abandoned)
+    [Parameter(Mandatory = $false)][switch]$help,
+    [Parameter(Mandatory = $false)][array]$pclist = $pclist,
+    [Parameter(Mandatory = $false)][string]$version = $version,
+    [Parameter(Mandatory = $false)][string]$setupArgz = $setupArgz,
+    [Parameter(Mandatory = $false)][switch]$uninstall,
+    [Parameter(Mandatory = $false)][string]$uninstallArgz = $uninstallArgz,
+    [Parameter(Mandatory = $false)][switch]$patch,
+    [Parameter(Mandatory = $false)][string]$patchArgz = $patchArgz,
+    [Parameter(Mandatory = $false)][switch]$scheduled
+    )
+    #write-host "target count: $($target.count())"
+    if ($help) {
+      $info = ("
+    ****************************************************************
+    Install
+
+       <NO ARGS>      WILL USE $setupArgz WITH DEFAULT VALUES
+      -UNINSTALL      [SWITCH] UNINSTALLS ON PC(s) DEFINED IN $defaultPCList
+      -PATCH          [SWITCH] INSTALLS PATCH ON PC(s) DEFINED IN $defaultPCList
+      -PCLIST         [ARRAY]  PASS ARRAY WITH PC NAMES
+      -HELP           [SWITCH] RETURNS THIS HELP BLOCK
+    ")
+    return $info
+  }
+    <#-------------------------------------------------------------
+    ASSIGN SINGLE ARG TO BE INVOKED ON REMOTE PC
+    --------------------------------------------------------------#>
+    $passingArgz = ""
+    if($uninstall) { $passingArgz = $uninstallArgz.toupper()}                         
+    elseif($patch) { $passingArgz = $patchArgz.ToUpper() }
+    else{ $passingArgz = $setupArgz.toupper() }
+     
+   
+    <#---------------------------------------------------------------------
+    FINAL VALIDATION: BUILT TO FAIL. ELSE BRANCH CARRIES OUT REMOTE COMMANDS
+    -----------------------------------------------------------------------#>
+    $passingArgz = Validate_Mutate_Shake_Bake -passingArgz $passingArgz                 # returns "False" or arg validated
+    if($passingArgz -eq "False") { 
+      break
+    } else {    
+   #----------------------------------------------------------------                                  
+
+      write-Host ("
+      [TARGETS] 
+      ")
+      $pcList                                                        # pclist outside so it prints separate lines for each pc
+                                                                   # other vars below are 1 line so are included in string
+      write-host ("
+      [ARGUMENTS]
+      $passingArgz                                                                                    
+
+      [LOCAL STAGE]
+      $stage
+
+      [LAUNCHER]
+      $launcher
+      ")
+
+      if(!($scheduled)) { read-host "PRESS ENTER TO BEGIN INSTALLATION"}       # This is to pause to check arguments 
+      <#---------------------------------------------------------------------------------------------------------------
+      GET ONLY ACTIVE CONNECTIONS. COLLECT NON-PINGABL. 1st OPTION: PING ENGINE 2nd OPTION: CLASSIC PING    
+      --------------------------------------------------------------------------------------------------------------#>
+      $PCNotConnected = @()
+      $activePCList = @()
+
+      write-host "[PING CHECK]"
+        
+        try{ 
+          if(test-path -path $pingEnginePath) { $PCNotConnected = @(& `"$pingEnginePath`" $pclist)
+               
+          }else{ write-host ("[NOT FOUND] $($pingEnginePath)
+                              [TRYING PING THE SLOW WAY]
+                             ")
+             foreach($pc in $pclist){ 
+               try{ Test-connection -computername $pc -count 1 -erroraction stop | out-null 
+               }catch{ $PCNotConnected += $pc} 
+                continue 
+             }
+          }
+
+          for($i=0;$i-lt$pclist.count;$i++) { if(!($PCNotConnected -contains $pclist[$i])) { $activePCList += $pclist[$i] }
+          }
+        }catch{break}
+
+    if(($activePCList.count) -gt 0) {
+      #----------------------------------------------------------------------------------------------------------------
+       
+      if ($null -eq $cred) {                                                                        # preventing constant cred punching
+	  $global:cred = Get-Credential
+      }
+      
+      if ($null -ne $cred) {                                                                        # preventing runs with no creds (cred prompt was cancelled)
+        $error.Clear()																				
+        try { 																						# scriptblock invoked on client as if logged in.
+          invoke-command -computername $activePCList -Credential $cred -ScriptBlock {   
+          $passingArgz = $using:passingArgz                                                         # 'using' req for vars out of invoke scope. This brings them in
+          $stage = $using:stage
+          $version = $using:version
+          $launcher = $using:launcher
+          set-location -path $stage
+
+          try{
+          start-process $launcher -wait -ArgumentList $passingArgz -PassThru                        # install command 
+          }catch{
+          continue
+          }
+
+          }
+        }catch{ $error[0]}
+      }else{ write-host "CREDENTIAL FAILED"                                                         # abort if bad creds
+      break    
+      }
+
+    if($PCNotConnected.count -gt 0) {                                                                 # show inaccessible pc names
+    write-host ("
+    [NOT ACCESSIBLE]
+    ")
+    $PCNotConnected
+    }
+    }
+  }
+}
+  
+<#---------------------------------------------------------------------------------------
+VALIDATEVARIABLES
+
+.DESCRIPTION 
+THIS TAKES AN ARRAY OF VARIABLES(BY VALUE) AND CHECKS THEM WITH VARIOUS TESTS
+---------------------------------------------------------------------------------------#>
+  function ValidateVariables {
+    param(
+    [Parameter(Mandatory = $false)][array]$variables)                                  
+
+    foreach($var in $variables) {
+      if ($var.contains("<") -or $var.contains(">")) {
+        write-host "$var Angle brackets '<' or '>' reserved for placeholder values. Make $var = `"`" to skip this arg"
+        $result = $false                   
+        return $false
+      }
+    }
+
+    if(!(test-path -path $dirCopySource)){                                                         # check source folder exists
+      write-host "[NOT RESOLVING PATH] $dirCopySource"
+      $result = $false
+      return $false
+    }
+
+    if($launcher.contains("MSIEXEC") -and ((!($uninstallArgz.toupper()).substring(0,3)) -eq "/X ")) {
+      write-host "[`"/X`" MISSING] $uninstallArgz"
+      return $false
+      }
+    if($launcher.contains("MSIEXEC") -and ((!($setupArgz.toupper()).substring(0,3)) -eq "/I ")) {
+      write-host "[`"/I`" MISSING] $setupArgz"
+      return $false
+    } 
+    return $true
+  }
+
+<#--------------------------------------------------------------------------------------------------
+VALIDATE_MUTATE_SHAKE_BAKE (serious name pending)
+    
+.DESCRIPTION
+COMMON MISTAKES CHECK. TAKES STRING ARG POTENTIALLY CHANGES IT AND RETURNS IT OR RETURNS "FALSE"
+---------------------------------------------------------------------------------------------------#>
+  function Validate_Mutate_Shake_Bake {
+    param([Parameter(Mandatory = $false)][string]$passingArgz = "NOTHING")
+
+      if($passingArgz -ne "NOTHING") {  
+        $passingArgz = $passingArgz.toupper()                                                           
+      $noLauncherInArgMsg = ("
+      [CMD OR MSIEXEC IN ARG - ASSIGN TO LAUNCHER VARIABLE] $($passingArgz)
+      ")
+
+      $prependSwitchMsg = ("
+      [PREPENDING /C SWITCH] /c $($passingArgz)
+      ")
+        if($passingArgz -eq "") { 
+        write-host "[OPTION NOT AVAILABLE - EMPTY ARGUMENT]" 
+        return $false }
+
+        if($passingArgz.contains("MSIEXEC") -or $passingArgz.contains("MSIEXEC.EXE")) { 
+        $noLauncherInArgMsg 
+        return $false }
+    
+        if($passingArgz.contains("CMD") -or $passingArgz.contains("CMD.EXE")) { 
+        $noLauncherInArgMsg
+        return $false }
+    
+        if((!($passingArgz.contains("/C "))) -and ($launcher.toupper()).contains("CMD")) {              # if /c or /k is not in arg...
+        if(!($passingArgz.contains("/K "))) {                                                       # /k keeps it open (for troubleshooting)
+            $prependSwitchMsg
+            $passingArgz = "/c $($passingArgz)"                                                       # check if launcher is cmd and add /c (execute & close switch)
+          }
+        }
+        return $passingArgz
+      }else{
+      return "False"
+    }
+  }
+<#-------------------------------------------------------------------------------------
+STARTINTERACTIVE
+
+.DESCRIPTION
+WALK-THROUGH SEQUENCE. WILL CALL PCLIST > COPYFILESTOPC > INSTALL. REQUIRES USER INPUT
+--------------------------------------------------------------------------------------#>
+  function StartInteractive {
+  param(
+  [Parameter(Mandatory = $false)][switch]$help,
+  [Parameter(Mandatory = $false)][string]$version = $version
+  )
+    if ($help) {
+      $helpinfo = ("
+    **********************************************************************************************
+    StartInteractive 
+
+      INTERACTIVELY RUNS THIS REMOTE INSTALL SEQUENCE 
+      (REQUIRES USER INPUT)
+
+      1. PCListEdit         OPENS $defaultPCList ADD PC NAMES WITHOUT QUOTES (LINE DELIMITED). SAVE & CLOSE
+      2. CopyFilesToPC      COPIES FILES TO EACH PC USING ROBOCOPY
+      3. Install            WILL INSTALL/UNINSTALL/PATCH DEPENDING ON SELECTION
+
+      -VERSION       NOT USED BY DEFAULT. CAN BUILD-IN CUSTOM IF SOURCE DIR NAME INCLUDES VERSION 
+    ")
+      return $helpinfo
+    }
+
+    function versionRequiredFunc {                               # if mandatory set to true cannot call script without version param.
+    if($null -eq $version){ 
+      $version = read-host "version:"
+    }
+    if($null -eq $version){ 
+      versionRequiredFunc 
+    }
+    # write-host "version selected $($version)"
+    }
+  
+
+    function choices {
+      param([Parameter(Mandatory = $false)] [switch]$encourage)                # This switch shows full Options dialog. 
+      if ($encourage) {
+      write-host ("
+            [X] UNINSTALL
+            [I] INSTALL/UPDATE
+            [P] PATCH
+          ")
+      }
+      $choice = (read-host "Option").toupper()
+      if ($choice -eq 'X') { Install -pclist $PCListValid -uninstall }
+      elseif ($choice -eq 'I') { Install -pclist $PCListValid }
+      elseif ($choice -eq 'P') { Install -pclist $PCListValid -patch }
+      else { choices }                                                              # if input is invalid, re-call without -excourage. Just "Option:"
+    }
+
+    versionRequiredFunc
+
+    if(ValidateVariables -variables $scriptVariables){
+  
+    write-host ("
+    [OPENING NOTEPAD] ADD PC NAMES ONE PER LINE - NO QUOTES     
+    ")
+
+    try   { $PCListValid = PCListEdit } 
+    catch { write-host "$($error[0])"
+    break
+    }
+
+  $copyAnswer = Read-host ("
+  [COPY TO PCs]. PRESS ENTER TO BEGIN OR TYPE 's' TO SKIP")
+        if   ( $copyAnswer.toupper().Contains('S')) { Write-host "SKIPPING COPY"
+        }else{ copyFilesToPC -pclist $pcListValid }
+  
+  choices -encourage                                                                     # -encourage inner func prints full Options dialog 
+  }
+}
+<#-------------------------------------------------------------------------------------
+GO
+
+.DESCRIPTION 
+SHORTER FUNCTION CALL THAT CALLS STARTINTERACTIVE. FOR USER-FRIENDLINESS
+--------------------------------------------------------------------------------------#>
+function go {
+StartInteractive
+}
+
+<#-----------------------------------------------------------------------------------
+TESTING
+
+.DESCRIPTION
+Provides tests args for msi or cmd run path
+---------------------------------------------------------------------------------------#>
+function testing {
+  param(
+      [Parameter(Mandatory = $false)] [switch]$msi,
+      [Parameter(Mandatory = $false)] [switch]$cmd,
+      [Parameter(Mandatory = $false)] [array]$pclist = $pclist     # sets default value to passed array from global scope for stacking scripts in deployment
+    )
+
+  if($msi){
+[string]$global:setupArgz =  "/i `"EmbravaConnect.msi`" /qn Connections=TEAMS,TEAMSSERVER ConnectionsSelected=TEAMSSERVER SilentConnectionSettings=Yes StartApp=Yes INSTALLDESKTOPSHORTCUT=NO AutoUpdateDisabled=Yes"  
+[string]$global:uninstallArgz = "/x `"EmbravaConnect.msi`" /qn PreserveSettings=No"                      
+[string]$global:launcher = "msiexec.exe"
+[string]$global:dirCopySource = "\\pbsenv.lan\l\IT\Drivers\EmbravaConnect\EmbravaConnect_v5.3.0"   
+[string]$global:patchArgz = ""
+}
+  if($cmd){
+[string]$global:setupArgz =  "/c JabraDirectSetup.exe /install /quiet /norestart /log JabraDirect-Install.log"
+[string]$global:uninstallArgz = "/c JabraDirectSetup.exe /uninstall /quiet /log JabraDirect-Install.log"
+[string]$global:patchArgz = ""                                 
+[string]$global:launcher = "cmd.exe" 
+[string]$global:dirCopySource = "\\pbsenv.lan\l\IT\Drivers\Jabra"       
+}
+
+[string]$global:dirParent =  ($global:dirCopySource) -replace ('.*\\')                  # used for local stage sub folder name.
+[string]$global:stage = "c:\users\public\stage\$($dirParent)"                    # working local directory where installer files will be copied to on remote machine
+[string]$global:remoteStage = $global:stage.replace(':', '$')                           # replaces with $ as c drive may not be shared
+[string]$global:softName = "$global:dirParent"                                          # used for script name (when auto-generated) and log name.
+[string]$global:timestamp = "$(get-date -Format('yyyyMMddhhmmss'))"
+[string]$global:log = "$global:stage\$($global:softName)-$($global:timestamp).txt"                    # log var made (not used by default in template)
+[string]$global:addArgzRobo = "/njh /njs /ndl /nc /ns /np /e /R:0 /W:0" #/mt:8)  # Robocopy switches. Remove /MT (multi-thread) if big files. For lots of small files do MT:8 (or higher)
+[array]$scriptVariables = @($global:setupArgz,$global:uninstallArgz,$global:patchArgz,$global:launcher,$global:dirCopySource,$global:softName)
+
+$restrictRemoteInstall = $false
+
+StartInteractive
+
+}
+<#-------------------------------------------------------------------------------------
+HELP
+
+.DESCRIPTION
+WILL GET ALL HELP BLOCKS FROM EACH FUNCTION AND RETURN THEM AS ONE STRING
+--------------------------------------------------------------------------------------#>
+  function help {
+
+    set-location $psscriptroot
+
+    [string]$TemplateHelp = ("
+    **********************************************************************************
+    IF USING AS TEMPLATE 
+
+      ASSIGN APPROPRIATE GLOBAL VARIABLE VALUES AT TOP OF SCRIPT.
+    
+      CONFIG OPTIONS FOR INSTALLER (GENERIC INFO)
+
+       CMD:
+       .\setup.exe -help, /help or /?
+
+       PS:
+       start-process powershell -wait -argumentlist  `".\setup.exe`" -help
+
+      THESE METHODS MAY NOT WORK FOR DISPLAYING PARAMETERS OF AN INSTALLER. 
+      REFER TO SOFTWARE DOCUMENTATION.
+    ")
+    [string]$CopyHelp = CopyFilesToPC -help
+    [string]$InstallHelp = Install -help
+    [string]$UsageHelp = "for usage: " + ".\$($scriptFullName)" + " -help"
+    [string]$InteractiveHelp = StartInteractive -help
+    $allHelp = @("
+    $($UsageHelp)
+    $($CopyHelp)
+    $($InstallHelp)
+    $($TemplateHelp)
+    $($InteractiveHelp)
+    ")
+      return $allHelp
+  }
+
+
+<#----------------------------------------------------------------------------------------
+BODY ARGS
+-----------------------------------------------------------------------------------------#>
+if($restrictInstall) {
+    if(($($env:computername)).toupper() -ne ($remoteInstallServer).toupper()) {
+      write-host "[INSTALL IS RESTRICTED TO REMOTE INSTALL SERVER]"
+      break
+    }
+}
+
+if($help){
+help
+break
+}
+
+if((!($scheduled)) -or ($interactive)) {
+  write-host ("
+  *******************************************************
+  to start type `"go`" <ENTER>
+  for help type .\$(($MyInvocation).MyCommand) -help
+  *******************************************************
+  ") 
+}     
