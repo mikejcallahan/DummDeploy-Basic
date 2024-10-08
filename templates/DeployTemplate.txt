@@ -32,7 +32,7 @@ EXAMPLE FOR EXE        (SETUP.EXE /HELP OR /? OR -HELP)
 ---------------------------------------------------------------------------------------------#><#
   [string]$setupArgz = "setup.exe -xml .\pim\xml\mathcad.xml" 
   [string]$uninstallArgz = ""
-  [string]$dirCopySource = "\\pbsenv.lan\l\IT\CADD\Software\Mathcad\Installer\Prime_7"
+  [string]$dirCopySource = "\\<domain>\Software\Mathcad\Installer\Prime_7"
   [string]$launcher = "cmd.exe'
 
 ----------------------------------------------------------------------------------------------------------------#><#
@@ -44,8 +44,8 @@ EXAMPLE FOR MSI         (MSIEXEC.EXE -HELP)         # NOTE ESCAPING INNER QUOTES
 CAN LEAVE THESE VARIABLES AS IS
 --------------------------------------------------------------------------------------------------------------------#>
 [boolean]$restrictRemoteInstall = $true
-[string]$pingEnginePath = "\\pbsenv.lan\l\IT\Scripts\new\MISC\pcping5.exe"      # this needs to be stored locally. Wont work in net location
-[string]$remoteInstallServer = "OR-PO-IT01"
+[string]$pingEnginePath = ".\util\pcping5.exe"      # this needs to be stored locally. Wont work in net location
+[string]$remoteInstallServer = "<servername>"
 [string]$defaultPCList = ".\pclist"                                       # file that holds the list of targets (line delimited) 
 [string]$dirParent =  ($dirCopySource) -replace ('.*\\')                  # used for local stage sub folder name.
 [string]$stage = "c:\users\public\stage\$($dirParent)"                    # working local directory where installer files will be copied to on remote machine
@@ -475,7 +475,7 @@ function testing {
 [string]$global:setupArgz =  "/i `"EmbravaConnect.msi`" /qn Connections=TEAMS,TEAMSSERVER ConnectionsSelected=TEAMSSERVER SilentConnectionSettings=Yes StartApp=Yes INSTALLDESKTOPSHORTCUT=NO AutoUpdateDisabled=Yes"  
 [string]$global:uninstallArgz = "/x `"EmbravaConnect.msi`" /qn PreserveSettings=No"                      
 [string]$global:launcher = "msiexec.exe"
-[string]$global:dirCopySource = "\\pbsenv.lan\l\IT\Drivers\EmbravaConnect\EmbravaConnect_v5.3.0"   
+[string]$global:dirCopySource = "<TestCopySource>"   
 [string]$global:patchArgz = ""
 }
   if($cmd){
@@ -483,7 +483,7 @@ function testing {
 [string]$global:uninstallArgz = "/c JabraDirectSetup.exe /uninstall /quiet /log JabraDirect-Install.log"
 [string]$global:patchArgz = ""                                 
 [string]$global:launcher = "cmd.exe" 
-[string]$global:dirCopySource = "\\pbsenv.lan\l\IT\Drivers\Jabra"       
+[string]$global:dirCopySource = "<testCopySource>"       
 }
 
 [string]$global:dirParent =  ($global:dirCopySource) -replace ('.*\\')                  # used for local stage sub folder name.
